@@ -1,19 +1,23 @@
 # project_path/frontend/app.py
 
-import streamlit as st
-import requests
 import time
+import json
 from pathlib import Path
 import sys
+
+import streamlit as st
 
 # Add project root to Python path
 current_dir = Path(__file__).parent
 root_dir = current_dir.parent
 sys.path.append(str(root_dir))
 
+from backend.services.file_processor import FileProcessor
 from frontend.components.file_uploader import FileUploader
 from frontend.components.document_viewer import DocumentViewer
-from frontend.utils.config import config
+from frontend.utils.async_utils import run_async
+from frontend.utils import key_manager
+
 
 # Streamlit page configuration
 st.set_page_config(
@@ -21,9 +25,6 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
-
-# API endpoint
-API_BASE_URL = f"http://localhost:{config.PORT}/api/v1"
 
 
 class StreamlitApp:
@@ -50,23 +51,28 @@ class StreamlitApp:
         """
         Initialize the Streamlit app and session state.
         """
-        self.file_uploader = FileUploader(API_BASE_URL)
-        self.document_viewer = DocumentViewer(API_BASE_URL)
+        self.processor = FileProcessor()
+        self.file_uploader = FileUploader(self.processor)
+        self.document_viewer = DocumentViewer(self.processor)
 
         # Session state initialization
         if "selected_doc_id" not in st.session_state:
             st.session_state.selected_doc_id = None
+        if "active_api_key" not in st.session_state:
+            st.session_state.active_api_key = None
 
     def run(self):
         """
         Run the Streamlit app UI and route between pages.
         """
-        # Header
         st.title("Playground Phân tích tài liệu Upstage")
-        st.info("Liên hệ: https://www.linkedin.com/in/lsjsj92/")
 
         # Sidebar menu
         with st.sidebar:
+            st.header("API Key")
+            self._render_api_key_section()
+            st.markdown("---")
+
             st.header("Danh mục")
             page = st.radio(
                 "Chọn trang",
@@ -77,8 +83,7 @@ class StreamlitApp:
                 ],
             )
 
-            # API status check
-            self._render_api_status_sidebar()
+            self._render_system_summary_sidebar()
 
         # Page routing
         if page == "Tải tệp lên":
@@ -88,40 +93,54 @@ class StreamlitApp:
         elif page == "Trình xem tài liệu":
             self._render_document_viewer()
 
-    def _render_api_status_sidebar(self):
-        """
-        Render API status and system summary in the sidebar.
-        """
-        st.markdown("---")
-        st.markdown("#### Trạng thái API")
+    def _render_api_key_section(self):
+        data = key_manager.load_keys()
+        keys = data.get("keys", [])
+        active_key = data.get("active_key")
 
-        try:
-            response = requests.get(
-                f"{API_BASE_URL.replace('/api/v1', '')}/health", timeout=5
-            )
-            if response.status_code == 200:
-                health_data = response.json()
-                st.success("API đã kết nối")
+        if keys:
+            options = []
+            for idx, key in enumerate(keys):
+                if len(key) <= 8:
+                    label = f"{idx + 1}: {key}"
+                else:
+                    label = f"{idx + 1}: {key[:4]}...{key[-4:]}"
+                options.append((label, key))
 
-                if "features" in health_data:
-                    features = health_data["features"]
-                    if "hybrid_parsing" in features:
-                        st.success("Hybrid Parsing khả dụng")
-                    if "ocr_text_extraction" in features:
-                        st.success("Trích xuất văn bản OCR")
+            labels = [item[0] for item in options]
+            key_map = {item[0]: item[1] for item in options}
+            default_index = 0
+            if active_key in keys:
+                default_index = keys.index(active_key)
+
+            selected_label = st.selectbox("Chọn API key", labels, index=default_index)
+            selected_key = key_map[selected_label]
+            if selected_key != active_key:
+                key_manager.set_active_key(selected_key)
+                active_key = selected_key
+        else:
+            st.info("Chưa có API key nào được lưu.")
+
+        new_key = st.text_input("Nhập API key mới", type="password")
+        if st.button("Lưu API key"):
+            if new_key.strip():
+                data = key_manager.add_key(new_key.strip())
+                active_key = data.get("active_key")
+                st.success("Đã lưu API key.")
+                st.rerun()
             else:
-                st.error("Lỗi API")
-        except Exception:
-            st.error("Không thể kết nối API")
+                st.warning("Vui lòng nhập API key.")
 
+        st.session_state.active_api_key = active_key
+
+    def _render_system_summary_sidebar(self):
+        st.markdown("#### Tóm tắt hệ thống")
         try:
-            response = requests.get(f"{API_BASE_URL}/analytics/summary", timeout=5)
-            if response.status_code == 200:
-                analytics = response.json()
-                summary = analytics.get("summary", {})
-
-                st.metric("Tổng tài liệu", summary.get("total_documents", 0))
-                st.metric("Đã hoàn tất", summary.get("completed_documents", 0))
+            documents = run_async(self.processor.get_all_documents())
+            total = len(documents)
+            completed = len([d for d in documents if d.parsing_status == "completed"])
+            st.metric("Tổng tài liệu", total)
+            st.metric("Đã hoàn tất", completed)
         except Exception:
             pass
 
@@ -130,6 +149,10 @@ class StreamlitApp:
         Render the file upload and parsing page.
         """
         st.header("Tải tệp và phân tích")
+
+        if not st.session_state.active_api_key:
+            st.warning("Vui lòng nhập API key để tải lên và phân tích tài liệu.")
+            return
 
         st.info(
             "Tệp hỗ trợ: PDF, DOCX, PPTX, JPG, JPEG, PNG (Tối đa 50MB)"
@@ -143,7 +166,6 @@ class StreamlitApp:
         )
 
         if uploaded_file:
-            # File information
             col1, col2, col3 = st.columns(3)
             with col1:
                 st.write(f"**Tên tệp:** {uploaded_file.name}")
@@ -154,90 +176,38 @@ class StreamlitApp:
 
             if st.button("Bắt đầu phân tích", type="primary"):
                 with st.spinner("Đang tải tệp và bắt đầu phân tích."):
-                    success, result = self.file_uploader.upload_file(uploaded_file)
+                    success, result = self.file_uploader.upload_file(
+                        uploaded_file, st.session_state.active_api_key
+                    )
 
                     if success:
-                        st.success("Tải tệp thành công!")
-
-                        # Monitor parsing progress
-                        self._monitor_parsing_progress(result["id"])
+                        st.success("Phân tích hoàn tất!")
+                        self._render_parsing_stats(result)
                     else:
-                        st.error(f"Tải lên thất bại: {result}")
+                        # Check if result contains error message format
+                        if isinstance(result, str):
+                            error_msg = result
+                        else:
+                            error_msg = str(result)
+                        st.error(f"**Phân tích thất bại:** {error_msg}")
 
-    def _monitor_parsing_progress(self, doc_id: str):
-        """
-        Monitor parsing progress for a document.
+    def _render_parsing_stats(self, record):
+        if not record or not record.parsed_data:
+            return
+        elements = record.parsed_data.elements
+        pages = max((elem.page for elem in elements), default=0)
+        image_elements = [e for e in elements if e.base64_encoding]
+        text_elements = [e for e in elements if e.content and e.content.text]
 
-        Args:
-            doc_id: Document ID to monitor.
-        """
-        progress_container = st.container()
-
-        with progress_container:
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            stats_container = st.empty()
-
-        for i in range(120):  # 4 minute timeout
-            try:
-                response = requests.get(f"{API_BASE_URL}/documents/{doc_id}")
-                if response.status_code == 200:
-                    doc_data = response.json()
-                    status = doc_data["parsing_status"]
-
-                    if status == "completed":
-                        progress_bar.progress(100)
-                        status_text.success("Phân tích hoàn tất!")
-
-                        # Display parsing results
-                        if doc_data.get("parsed_data"):
-                            elements = doc_data["parsed_data"].get("elements", [])
-                            pages = max([elem["page"] for elem in elements], default=0)
-                            image_elements = [
-                                e for e in elements if e.get("base64_encoding")
-                            ]
-                            text_elements = [
-                                e
-                                for e in elements
-                                if e.get("content", {}).get("text")
-                            ]
-
-                            with stats_container:
-                                col1, col2, col3, col4 = st.columns(4)
-                                with col1:
-                                    st.metric("Tổng phần tử", len(elements))
-                                with col2:
-                                    st.metric("Trang", pages)
-                                with col3:
-                                    st.metric("Phần tử hình ảnh", len(image_elements))
-                                with col4:
-                                    st.metric("Phần tử văn bản", len(text_elements))
-
-                        if st.button("Xem tài liệu"):
-                            st.session_state.selected_doc_id = doc_id
-                            st.success(
-                                "Tài liệu đã được chọn. Hãy chuyển sang tab Trình xem tài liệu."
-                            )
-                        break
-
-                    if status == "failed":
-                        progress_bar.progress(0)
-                        status_text.error(
-                            f"Phân tích thất bại: {doc_data.get('error_message', 'Lỗi không xác định')}"
-                        )
-                        break
-                    if status == "processing":
-                        progress_bar.progress(min(50 + i, 90))
-                        status_text.info("Đang phân tích")
-                    else:
-                        progress_bar.progress(min(i * 2, 30))
-                        status_text.info("Đã thêm vào hàng đợi phân tích")
-
-                time.sleep(2)
-
-            except Exception as e:
-                status_text.error(f"Lỗi kiểm tra trạng thái: {str(e)}")
-                break
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Tổng phần tử", len(elements))
+        with col2:
+            st.metric("Trang", pages)
+        with col3:
+            st.metric("Phần tử hình ảnh", len(image_elements))
+        with col4:
+            st.metric("Phần tử văn bản", len(text_elements))
 
     def _render_document_list(self):
         """
@@ -256,33 +226,25 @@ class StreamlitApp:
             sort_by = st.selectbox("Sắp xếp", ["Thời gian tải lên", "Tên tệp"])
 
         try:
-            response = requests.get(f"{API_BASE_URL}/documents")
-            if response.status_code == 200:
-                documents = response.json()
+            documents = run_async(self.processor.get_all_documents())
 
-                if status_filter:
-                    documents = [
-                        d for d in documents if d["parsing_status"] == status_filter
-                    ]
+            if status_filter:
+                documents = [d for d in documents if d.parsing_status == status_filter]
 
-                if not documents:
-                    st.info("Không có tài liệu phù hợp.")
-                    return
+            if not documents:
+                st.info("Không có tài liệu phù hợp.")
+                return
 
-                if sort_by == "Tên tệp":
-                    documents.sort(key=lambda x: x["original_filename"])
+            if sort_by == "Tên tệp":
+                documents.sort(key=lambda x: x.original_filename)
 
-                # Display document cards
-                for i, doc in enumerate(documents):
-                    self._render_document_card(doc, i)
-
-            else:
-                st.error("Không thể tải danh sách tài liệu.")
+            for i, doc in enumerate(documents):
+                self._render_document_card(doc, i)
 
         except Exception as e:
             st.error(f"Đã xảy ra lỗi: {str(e)}")
 
-    def _render_document_card(self, doc: dict, index: int):
+    def _render_document_card(self, doc, index: int):
         """
         Render a single document card.
 
@@ -297,26 +259,27 @@ class StreamlitApp:
             "pending": "warning",
         }
 
-        status_color = status_colors.get(doc["parsing_status"], "info")
+        status_color = status_colors.get(doc.parsing_status, "info")
 
-        with st.expander(f"{doc['original_filename']}", expanded=False):
+        with st.expander(f"{doc.original_filename}", expanded=False):
             col1, col2, col3 = st.columns([2, 1, 1])
 
             with col1:
                 st.markdown(
-                    f"**Trạng thái:** :{status_color}[{self._get_status_badge(doc['parsing_status'])}]"
+                    f"**Trạng thái:** :{status_color}[{self._get_status_badge(doc.parsing_status)}]"
                 )
-                st.write(f"**Thời gian tải lên:** {doc['upload_time'][:19]}")
-                st.write(f"**Kích thước tệp:** {doc['file_size']:,} bytes")
+                st.write(f"**Thời gian tải lên:** {self._format_time(doc.upload_time)}")
+                st.write(f"**Kích thước tệp:** {doc.file_size:,} bytes")
 
-                if doc["parsing_status"] == "completed" and doc.get("parsed_data"):
-                    elements = doc["parsed_data"].get("elements", [])
-                    pages = max([elem["page"] for elem in elements], default=0)
-                    image_elements = [
-                        e for e in elements if e.get("base64_encoding")
-                    ]
+                # Display error message if failed
+                if doc.parsing_status == "failed" and hasattr(doc, "error_message") and doc.error_message:
+                    st.error(f"**Lỗi:** {doc.error_message}")
 
-                    # Statistics
+                if doc.parsing_status == "completed" and doc.parsed_data:
+                    elements = doc.parsed_data.elements
+                    pages = max((elem.page for elem in elements), default=0)
+                    image_elements = [e for e in elements if e.base64_encoding]
+
                     stats_col1, stats_col2, stats_col3 = st.columns(3)
                     with stats_col1:
                         st.metric("Phần tử", len(elements))
@@ -326,28 +289,51 @@ class StreamlitApp:
                         st.metric("Hình ảnh", len(image_elements))
 
             with col2:
-                if doc["parsing_status"] == "completed":
+                if doc.parsing_status == "completed":
                     if st.button(
-                        "Xem tài liệu", key=f"view_{doc['id']}_{index}"
+                        "Xem tài liệu", key=f"view_{doc.id}_{index}"
                     ):
-                        st.session_state.selected_doc_id = doc["id"]
+                        st.session_state.selected_doc_id = doc.id
                         st.success(
                             "Tài liệu đã được chọn. Hãy chuyển sang tab Trình xem tài liệu."
                         )
+                    if st.button(
+                        "📋 Sao chép", key=f"copy_html_{doc.id}_{index}", help="Sao chép nội dung tài liệu đã được trích xuất"
+                    ):
+                            if doc.parsed_data and doc.parsed_data.content:
+                                html_content = doc.parsed_data.content.html
+                                if html_content:
+                                    st.code(html_content, language="html")
+                                    st.success("Nội dung đã được hiển thị ở trên. Bạn có thể copy từ code block.")
+                                else:
+                                    # Combine HTML from all elements if content.html is empty
+                                    html_parts = []
+                                    if doc.parsed_data.elements:
+                                        for elem in doc.parsed_data.elements:
+                                            if elem.content and elem.content.html:
+                                                html_parts.append(elem.content.html)
+                                    combined_html = "\n".join(html_parts)
+                                    if combined_html:
+                                        st.code(combined_html, language="html")
+                                        st.success("Nội dung đã được hiển thị ở trên. Bạn có thể copy từ code block.")
+                                    else:
+                                        st.warning("Không có nội dung để sao chép.")
+                            else:
+                                st.warning("Không có dữ liệu phân tích.")
                 else:
                     st.button(
                         "Đang xử lý...",
-                        key=f"waiting_{doc['id']}_{index}",
+                        key=f"waiting_{doc.id}_{index}",
                         disabled=True,
                     )
 
             with col3:
                 if st.button(
                     "Xóa",
-                    key=f"delete_{doc['id']}_{index}",
+                    key=f"delete_{doc.id}_{index}",
                     type="secondary",
                 ):
-                    if self._delete_document(doc["id"]):
+                    if self._delete_document(doc.id):
                         st.success("Đã xóa tài liệu.")
                         time.sleep(1)
                         st.rerun()
@@ -361,85 +347,60 @@ class StreamlitApp:
         st.header("Trình xem tài liệu")
         st.markdown("Hiển thị bố cục gốc + kết quả trích xuất văn bản từ ảnh")
 
-        # Document selection
         try:
-            response = requests.get(f"{API_BASE_URL}/documents")
-            if response.status_code == 200:
-                documents = response.json()
-                completed_docs = [
-                    doc for doc in documents if doc["parsing_status"] == "completed"
-                ]
+            documents = run_async(self.processor.get_all_documents())
+            completed_docs = [doc for doc in documents if doc.parsing_status == "completed"]
 
-                if not completed_docs:
-                    st.warning("Chưa có tài liệu hoàn tất.")
-                    return
+            if not completed_docs:
+                st.warning("Chưa có tài liệu hoàn tất.")
+                return
 
-                doc_options = {
-                    doc["original_filename"]: doc["id"] for doc in completed_docs
-                }
+            doc_options = {doc.original_filename: doc.id for doc in completed_docs}
 
-                # Check for pre-selected document
-                selected_filename = None
-                if st.session_state.selected_doc_id:
-                    for filename, doc_id in doc_options.items():
-                        if doc_id == st.session_state.selected_doc_id:
-                            selected_filename = filename
-                            break
+            selected_filename = None
+            if st.session_state.selected_doc_id:
+                for filename, doc_id in doc_options.items():
+                    if doc_id == st.session_state.selected_doc_id:
+                        selected_filename = filename
+                        break
 
-                if not selected_filename and doc_options:
-                    selected_filename = list(doc_options.keys())[0]
+            if not selected_filename and doc_options:
+                selected_filename = list(doc_options.keys())[0]
 
-                selected_filename = st.selectbox(
-                    "Chọn tài liệu",
-                    list(doc_options.keys()),
-                    index=list(doc_options.keys()).index(selected_filename)
-                    if selected_filename
-                    else 0,
-                )
+            selected_filename = st.selectbox(
+                "Chọn tài liệu",
+                list(doc_options.keys()),
+                index=list(doc_options.keys()).index(selected_filename)
+                if selected_filename
+                else 0,
+            )
 
-                if selected_filename:
-                    doc_id = doc_options[selected_filename]
-                    # Render document viewer
-                    self.document_viewer.render_document(doc_id)
-            else:
-                st.error("Không thể tải danh sách tài liệu.")
+            if selected_filename:
+                doc_id = doc_options[selected_filename]
+                self.document_viewer.render_document(doc_id)
 
         except Exception as e:
             st.error(f"Đã xảy ra lỗi: {str(e)}")
 
     def _get_status_badge(self, status):
-        """
-        Return a localized status label for display.
-
-        Args:
-            status: Parsing status string.
-
-        Returns:
-            str: Display label for the status.
-        """
         return self.STATUS_LABELS.get(status, status)
 
     def _delete_document(self, doc_id):
-        """
-        Delete a document by ID.
-
-        Args:
-            doc_id: Document ID to delete.
-
-        Returns:
-            bool: True on success, otherwise False.
-        """
         try:
-            response = requests.delete(f"{API_BASE_URL}/documents/{doc_id}")
-            return response.status_code == 200
+            return run_async(self.processor.delete_document(doc_id))
         except Exception:
             return False
 
+    def _format_time(self, value) -> str:
+        if isinstance(value, str):
+            return value[:19]
+        try:
+            return value.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return str(value)
+
 
 def main():
-    """
-    Application entry point.
-    """
     app = StreamlitApp()
     app.run()
 

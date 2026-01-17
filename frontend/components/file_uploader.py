@@ -1,7 +1,9 @@
 # project_path/frontend/components/file_uploader.py
 
-import requests
 from typing import Tuple, Any
+
+from backend.services.file_processor import FileProcessor
+from frontend.utils.async_utils import run_async
 
 
 class FileUploader:
@@ -9,16 +11,16 @@ class FileUploader:
     Streamlit component for uploading files to the backend API.
     """
 
-    def __init__(self, api_base_url: str):
+    def __init__(self, processor: FileProcessor):
         """
         Initialize the uploader.
 
         Args:
-            api_base_url: Backend API base URL.
+            processor: FileProcessor instance.
         """
-        self.api_base_url = api_base_url
+        self.processor = processor
 
-    def upload_file(self, uploaded_file) -> Tuple[bool, Any]:
+    def upload_file(self, uploaded_file, api_key: str) -> Tuple[bool, Any]:
         """
         Upload a file to the backend API.
 
@@ -28,28 +30,26 @@ class FileUploader:
         Returns:
             Tuple[bool, Any]: (success, response data or error message)
         """
+        if not api_key:
+            return False, "Vui lòng nhập API key trước khi phân tích."
         try:
-            files = {"file": (uploaded_file.name, uploaded_file.getvalue(), uploaded_file.type)}
+            self.processor.set_api_key(api_key)
 
-            response = requests.post(
-                f"{self.api_base_url}/upload",
-                files=files,
-                timeout=300,  # 5 minute timeout for large files
+            is_valid, error_message = self.processor.validate_file(
+                uploaded_file.name, uploaded_file.size
             )
+            if not is_valid:
+                return False, error_message
 
-            if response.status_code == 200:
-                return True, response.json()
-            error_detail = "Lỗi không xác định"
-            try:
-                error_data = response.json()
-                error_detail = error_data.get("detail", error_detail)
-            except Exception:
-                error_detail = response.text
-            return False, f"Tải lên thất bại ({response.status_code}): {error_detail}"
+            record = run_async(
+                self.processor.process_file(
+                    file_content=uploaded_file.getvalue(),
+                    filename=uploaded_file.name,
+                    content_type=uploaded_file.type or "application/octet-stream",
+                    background=False,
+                )
+            )
+            return True, record
 
-        except requests.exceptions.Timeout:
-            return False, "Tải lên bị hết thời gian. Vui lòng thử tệp nhỏ hơn."
-        except requests.exceptions.ConnectionError:
-            return False, "Không thể kết nối máy chủ API. Vui lòng kiểm tra máy chủ."
         except Exception as e:
-            return False, f"Lỗi tải lên: {str(e)}"
+            return False, f"Lỗi phân tích: {str(e)}"

@@ -18,14 +18,11 @@ class UpstageClient:
     def __init__(self, api_key: str = None):
         self.api_key = api_key or config.UPSTAGE_API_KEY
         self.base_url = config.UPSTAGE_API_URL
-
         if not self.api_key:
-            raise ValueError(
-                "Upstage API key is required. Please set UPSTAGE_API_KEY in environment variables."
-            )
+            self.api_key = None
 
     async def parse_document_with_hybrid_extraction(
-        self, file_path: Path, extract_images: bool = True
+        self, file_path: Path, extract_images: bool = False
     ) -> ParsedDocument:
         """
         Parse a document using the Upstage API.
@@ -44,6 +41,9 @@ class UpstageClient:
         """
         print(f"[UpstageClient] Starting document parsing: {file_path.name}")
         print("[UpstageClient] Calling Upstage API (single request for entire document)...")
+
+        if not self.api_key:
+            raise ValueError("Upstage API key is required for parsing.")
 
         headers = {"Authorization": f"Bearer {self.api_key}"}
 

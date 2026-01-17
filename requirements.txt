@@ -1,0 +1,8 @@
+streamlit
+html2text
+httpx
+aiofiles
+Pillow
+pydantic
+pydantic-settings
+python-dotenv

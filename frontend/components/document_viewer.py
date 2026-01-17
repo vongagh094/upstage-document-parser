@@ -1,6 +1,5 @@
 # project_path/frontend/components/document_viewer.py
 import streamlit as st
-import requests
 from typing import Dict, Any, List
 import base64
 from io import BytesIO
@@ -13,10 +12,13 @@ current_dir = Path(__file__).parent
 root_dir = current_dir.parent.parent
 sys.path.append(str(root_dir))
 
+from backend.services.file_processor import FileProcessor
+from frontend.utils.async_utils import run_async
+
 
 class DocumentViewer:
-    def __init__(self, api_base_url: str):
-        self.api_base_url = api_base_url
+    def __init__(self, processor: FileProcessor):
+        self.processor = processor
 
     def render_document(self, doc_id: str):
         """
@@ -29,10 +31,11 @@ class DocumentViewer:
             doc_id: Document ID to render.
         """
         try:
-            # Fetch base document data first
-            doc_response = requests.get(f"{self.api_base_url}/documents/{doc_id}")
-            doc_response.raise_for_status()
-            doc_data = doc_response.json()
+            record = run_async(self.processor.get_document(doc_id))
+            if not record:
+                st.error("Không tìm thấy tài liệu.")
+                return
+            doc_data = self._record_to_dict(record)
 
             if doc_data["parsing_status"] != "completed":
                 st.warning("Phân tích tài liệu chưa hoàn tất.")
@@ -57,10 +60,20 @@ class DocumentViewer:
 
             self._render_enhanced_main_view_with_hybrid(doc_data, selected_page)
 
-        except requests.exceptions.RequestException as e:
-            st.error(f"Không thể tải tài liệu từ API: {e}")
         except Exception as e:
             st.error(f"Lỗi khi hiển thị tài liệu: {str(e)}")
+
+    def _record_to_dict(self, record) -> Dict[str, Any]:
+        data = record.model_dump()
+        if record.parsed_data and record.parsed_data.elements:
+            for i, elem in enumerate(record.parsed_data.elements):
+                try:
+                    data["parsed_data"]["elements"][i]["ocr_enhanced"] = getattr(
+                        elem, "_ocr_enhanced", False
+                    )
+                except Exception:
+                    continue
+        return data
 
     def _render_enhanced_main_view_with_hybrid(
         self, doc_data: Dict[str, Any], page_num: int

@@ -8,11 +8,11 @@ from backend.models.document import DocumentRecord, DocumentElement, ElementCont
 from backend.services.upstage_client import UpstageClient
 from backend.services.storage import StorageService
 from backend.config import config
-from backend.utils.helpers import get_image_mime_type_from_base64
+from backend.utils.helpers import get_image_mime_type_from_base64, parse_api_error
 
 
 class FileProcessor:
-    def __init__(self):
+    def __init__(self, api_key: Optional[str] = None):
         """
         Initialize FileProcessor.
         - Create Upstage API client
@@ -24,7 +24,7 @@ class FileProcessor:
         # Ensure storage directories exist
         config.ensure_directories_exist()
 
-        self.upstage_client = UpstageClient()
+        self.upstage_client = UpstageClient(api_key=api_key)
         self.storage_service = StorageService()
         self.markdown_converter = html2text.HTML2Text()
         self.markdown_converter.ignore_links = True
@@ -33,12 +33,21 @@ class FileProcessor:
         print("[FileProcessor] Initialized with hybrid parsing capabilities")
         print(f"[FileProcessor] Storage directory: {config.STORAGE_DIR}")
 
+    def set_api_key(self, api_key: str):
+        if not api_key:
+            return
+        if self.upstage_client:
+            self.upstage_client.api_key = api_key
+        else:
+            self.upstage_client = UpstageClient(api_key=api_key)
+
     async def process_file(
         self,
         file_content: bytes,
         filename: str,
         content_type: str,
         enhanced_options: Optional[Dict[str, Any]] = None,
+        background: bool = True,
     ) -> DocumentRecord:
         """Process an uploaded file and start parsing."""
         record = await self.storage_service.save_uploaded_file(
@@ -46,16 +55,20 @@ class FileProcessor:
         )
 
         default_options = {
-            "extract_images": True,
+            "extract_images": False,
             "hybrid_parsing": True,
         }
 
         if enhanced_options:
             default_options.update(enhanced_options)
 
-        asyncio.create_task(self._parse_document_hybrid_async(record, default_options))
+        if background:
+            asyncio.create_task(self._parse_document_hybrid_async(record, default_options))
+            return record
 
-        return record
+        await self._parse_document_hybrid_async(record, default_options)
+        updated = await self.storage_service.get_document_record(record.id)
+        return updated or record
 
     def _convert_elements_to_markdown(self, elements: list[DocumentElement]) -> str:
         """Convert document elements to a single Markdown string in reading order."""
@@ -87,6 +100,9 @@ class FileProcessor:
     ):
         """Parse a document asynchronously using hybrid extraction."""
         try:
+            if not self.upstage_client or not self.upstage_client.api_key:
+                raise ValueError("Upstage API key is required for parsing.")
+
             await self._update_parsing_status(record.id, "processing")
 
             file_path = Path(record.file_path)
@@ -96,7 +112,7 @@ class FileProcessor:
                 f"[FileProcessor] Starting hybrid parsing for {record.original_filename}"
             )
             parsed_data = await self.upstage_client.parse_document_with_hybrid_extraction(
-                file_path=file_path, extract_images=options.get("extract_images", True)
+                file_path=file_path, extract_images=options.get("extract_images", False)
             )
 
             if parsed_data and parsed_data.elements:
@@ -124,8 +140,17 @@ class FileProcessor:
             await self.storage_service.save_parsed_data(record.id, parsed_data)
 
         except Exception as e:
-            await self._update_parsing_status(record.id, "failed", str(e))
-            print(f"Parsing failed (ID: {record.id}): {str(e)}")
+            error_message = str(e)
+            status_code, vietnamese_message = parse_api_error(error_message)
+            
+            # Format error message with Vietnamese message
+            if status_code:
+                formatted_error = f"[{status_code}] {vietnamese_message}"
+            else:
+                formatted_error = vietnamese_message
+            
+            await self._update_parsing_status(record.id, "failed", formatted_error)
+            print(f"Parsing failed (ID: {record.id}): {error_message}")
 
     def _generate_parsing_statistics(self, elements: List[DocumentElement]) -> str:
         """Generate parsing statistics including OCR info."""
